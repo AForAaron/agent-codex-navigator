@@ -11,13 +11,13 @@ const output = await build({
 });
 const { computeUsagePlacement } = await import(`data:text/javascript;base64,${Buffer.from(output.outputFiles[0].text).toString("base64")}`);
 const rail = { left: 0, top: 44, right: 52, bottom: 897, width: 52, height: 853 };
-const indicator = { width: 36, height: 92 };
+const indicator = { width: 36, height: 132 };
 
 test("native footer buttons push the quota display upward", () => {
   const profileOnly = { left: 8, top: 857, right: 44, bottom: 893, width: 36, height: 36 };
   const withUpdate = { ...profileOnly, top: 813, height: 80 };
-  assert.deepEqual(computeUsagePlacement(rail, profileOnly, indicator, 308), { left: 8, top: 753 });
-  assert.deepEqual(computeUsagePlacement(rail, withUpdate, indicator, 308), { left: 8, top: 709 });
+  assert.deepEqual(computeUsagePlacement(rail, profileOnly, indicator, 308), { left: 8, top: 713 });
+  assert.deepEqual(computeUsagePlacement(rail, withUpdate, indicator, 308), { left: 8, top: 669 });
 });
 
 test("hides when the native rail cannot fit the display without covering controls", () => {

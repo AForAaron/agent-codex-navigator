@@ -15,7 +15,7 @@ try {
     window.fetch = () => { requests++; throw Error("Unexpected network request"); };
     window.listeners = new Set();
     window.snapshot = (account, used) => ({ user_id: "user", account_id: account, rate_limit: {
-      primary_window: { used_percent: 84, limit_window_seconds: 18000 }, secondary_window: { used_percent: used, limit_window_seconds: 604800 } },
+      primary_window: { used_percent: 84, limit_window_seconds: 18000, reset_at: Math.floor(Date.now() / 1000) + 3600 }, secondary_window: { used_percent: used, limit_window_seconds: 604800, reset_at: Math.floor(Date.now() / 1000) + 6 * 86400 } },
       rate_limit_reset_credits: { available_count: 2 } });
     const main = { queryKey: ["rate-limit-status", "user", "account-a"], count: 1, getObserversCount() { return this.count; },
       state: { status: "success", data: snapshot("account-a", 99.6), dataUpdatedAt: Date.now() } };
@@ -29,6 +29,10 @@ try {
   });
   const values = () => page.locator(".cn-usage-value").allTextContents();
   assert.deepEqual(await values(), ["16%", "0%", "2次"]);
+  const initialReset = await page.evaluate(() => new Date(queries[0].state.data.rate_limit.primary_window.reset_at * 1000).toISOString());
+  assert.equal(await page.locator(".cn-usage-reset-time").first().getAttribute("datetime"), initialReset);
+  await page.evaluate(() => { queries[0].state.data.rate_limit.primary_window.reset_at += 7200; emit(queries[0]); });
+  assert.notEqual(await page.locator(".cn-usage-reset-time").first().getAttribute("datetime"), initialReset, "native reset changes must update without a network request");
   await page.clock.fastForward(8 * 60 * 60 * 1000);
   assert.deepEqual(await values(), ["16%", "0%", "2次"], "native cache is not expired by an unrelated local polling clock");
   await page.evaluate(() => {
