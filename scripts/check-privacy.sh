@@ -15,6 +15,11 @@ HITS="$(while IFS= read -r -d '' file; do
     if sed '/^Copyright (c) 2026 AForAaron$/d' "$file" | grep -qiE "$PATTERN"; then
       printf '%s\n' "$file"
     fi
+  elif [ "$file" = "scripts/launcher-resolver.mjs" ] || [ "$file" = "scripts/launcher-resolver.test.mjs" ]; then
+    # Exact public project identities are required to validate launcher discovery.
+    if sed -E 's#[Aa][Ff]or[Aa]aron/(agent-codex-navigator|codex-thread-navigator)##g' "$file" | grep -qiE "$PATTERN"; then
+      printf '%s\n' "$file"
+    fi
   elif grep -qiE "$PATTERN" "$file" 2>/dev/null; then
     printf '%s\n' "$file"
   fi
