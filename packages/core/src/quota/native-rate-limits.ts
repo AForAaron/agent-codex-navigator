@@ -19,7 +19,14 @@ function windowFrom(value: unknown): QuotaWindow | null {
   };
 }
 
-/** Read only the three quota fields from the native usage snapshot. */
+/** Preserve decimal credit balances without guessing units or rounding. */
+export function parseNativeCreditBalance(value: unknown): string | null {
+  if (typeof value === "number") return Number.isFinite(value) && value >= 0 ? String(value) : null;
+  if (typeof value !== "string" || !/^\d+(?:\.\d+)?$/.test(value)) return null;
+  return value.replace(/^0+(?=\d)/, "").replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+/** Read quota and account credit fields from the native usage snapshot. */
 export function parseNativeRateLimits(snapshot: unknown): CodexRateLimits | null {
   const input = record(snapshot);
   const limits = record(input?.rate_limit);
@@ -28,6 +35,6 @@ export function parseNativeRateLimits(snapshot: unknown): CodexRateLimits | null
   const secondary = windowFrom(limits.secondary_window);
   const count = record(input?.rate_limit_reset_credits)?.available_count;
   if (!primary && !secondary) return null;
-  return { primary, secondary, resetCreditsAvailable:
+  return { primary, secondary, creditBalance: parseNativeCreditBalance(record(input?.credits)?.balance), resetCreditsAvailable:
     typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : null };
 }

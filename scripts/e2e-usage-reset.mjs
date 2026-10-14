@@ -28,11 +28,26 @@ try {
     return { width: root.width, height: root.height, left: root.left, gap: footer.top - root.bottom,
       overflow: [...document.querySelectorAll(".cn-usage span,.cn-usage time")].some(n => { const r = n.getBoundingClientRect(); return r.width && (r.left < root.left - .5 || r.right > root.right + .5); }) };
   });
-  assert.deepEqual(geometry, { width: 36, height: 132, left: 8, gap: 12, overflow: false });
+  assert.deepEqual(geometry, { width: 36, height: 220, left: 8, gap: 12, overflow: false });
   for (const theme of ["dark", "light"]) {
     await page.emulateMedia({ colorScheme: theme });
-    await page.screenshot({ path: `/private/tmp/cn-reset-${theme}.png`, clip: { x: 0, y: 600, width: 52, height: 301 } });
+    await page.screenshot({ path: `/private/tmp/cn-reset-${theme}.png`, clip: { x: 0, y: 500, width: 52, height: 401 } });
   }
+  assert.equal(await page.locator('.cn-usage-label').nth(2).textContent(), '重置');
+  const button = page.locator('.cn-protection-button');
+  assert.equal(await button.getAttribute('aria-pressed'), 'false');
+  await button.click();
+  assert.equal(await button.getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.locator('.cn-protection-status').textContent(), '保护\n不可用');
+  assert.match(await button.getAttribute('aria-label'), /不会停止任务/);
+  for (const theme of ['dark', 'light']) {
+    await page.emulateMedia({ colorScheme: theme });
+    await page.screenshot({ path: `/private/tmp/cn-protection-${theme}.png`, clip: { x: 0, y: 500, width: 140, height: 401 } });
+  }
+  assert.equal(await button.evaluate(n => { const r=n.getBoundingClientRect(); return r.width === 36 && r.height === 36; }), true);
+  await button.press('Space');
+  assert.equal(await button.getAttribute('aria-pressed'), 'false');
+  assert.equal(await page.locator('.cn-protection-status').isVisible(), false);
   await page.clock.fastForward(24001);
   assert.equal(await page.locator(".cn-usage-reset-date").first().textContent(), "剩58分", "countdown changes at its minute boundary without native events");
   assert.equal(await page.locator(".cn-usage-reset-time").first().isVisible(), false);
@@ -43,6 +58,14 @@ try {
   assert.equal(await page.locator(".cn-usage-reset-time").first().isVisible(), false);
   await page.evaluate(() => { data.limits.primary.resetsAt = Date.parse("2026-10-12T04:00:00Z"); data.updatedAt = Date.now(); widget.setState(data); });
   assert.equal(await page.locator(".cn-usage-reset-date").first().textContent(), "剩122分");
+  // A replacement deadline must be adopted even with an unchanged percentage.
+  await page.evaluate(() => { data.limits.primary.resetsAt = Date.now() + 120 * 60000; widget.setState(data); });
+  assert.equal(await page.locator(".cn-usage-reset-date").first().textContent(), "剩120分");
+  // Simulate sleep: wall-clock changes without running each intervening timer.
+  const wakeTime = await page.evaluate(() => data.limits.primary.resetsAt - 30 * 60000);
+  await page.clock.setSystemTime(new Date(wakeTime));
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  assert.equal(await page.locator(".cn-usage-reset-date").first().textContent(), "剩30分");
   await page.evaluate(() => { data.limits.secondary.resetsAt = null; widget.setState(data); });
   assert.equal(await page.locator(".cn-usage-reset-date").nth(1).textContent(), "未提供");
   assert.equal(await page.locator(".cn-usage-reset-time").nth(1).isVisible(), false);
@@ -53,5 +76,5 @@ try {
   await page.evaluate(() => widget.dispose());
   await page.clock.fastForward(8 * 3600000);
   assert.equal(await page.locator("output").count(), 0);
-  console.log("PASS native reset dates, time-zone display, deadline/no refill, missing data, 132px clearance, themes and disposal");
+  console.log("PASS native reset dates, time-zone display, deadline/no refill, missing data, 220px clearance, themes and disposal");
 } finally { await browser.close(); }

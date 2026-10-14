@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseNativeRateLimits } from "./native-rate-limits.js";
+import { parseNativeRateLimits, parseNativeCreditBalance } from "./native-rate-limits.js";
 import { codexUsageWindows } from "./codex-rate-limits.js";
 
 const window = (used: number, seconds: number) => ({ used_percent: used, limit_window_seconds: seconds, reset_at: 1790000000 });
@@ -22,4 +22,12 @@ test("malformed native snapshots cannot become invented percentages or reset cou
   const limits = parseNativeRateLimits({ rate_limit: { primary_window: window(100, 18000) }, rate_limit_reset_credits: { available_count: -1 } });
   assert.equal(limits!.resetCreditsAvailable, null);
   assert.equal(limits!.primary!.remainingPercent, 0);
+});
+
+
+test("native account credit balance preserves decimals, zero and rejects invalid data", () => {
+  for (const [input, expected] of [[0,"0"], [12.5,"12.5"], ["00012.3400","12.34"], ["0.0001","0.0001"], [null,null], ["",null], ["-1",null], [NaN,null], [Infinity,null], ["1e3",null], [true,null]] as const) {
+    assert.equal(parseNativeCreditBalance(input), expected);
+  }
+  assert.equal(parseNativeRateLimits({ rate_limit: { primary_window: window(10,18000) }, credits: { balance: "20.25" } })!.creditBalance, "20.25");
 });

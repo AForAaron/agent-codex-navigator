@@ -1,11 +1,12 @@
+import { createProtectionControl, PROTECTION_CONTROL_CSS, type ProtectionMode, type ProtectionStatus } from "./protection-control.ts";
 import { codexUsageWindows, type CodexRateLimits } from "../../../core/src/quota/codex-rate-limits.ts";
 import { formatQuotaReset, formatQuotaCountdown } from "../../../core/src/quota/reset-time.ts";
 
 /** Passive quota readings and their native reset timestamps. */
-export const USAGE_INDICATOR_CSS = `
+export const USAGE_INDICATOR_CSS = PROTECTION_CONTROL_CSS + `
 .cn-usage {
   width: 36px;
-  height: 132px;
+  min-height: 220px;
   display: grid;
   align-content: center;
   gap: 6px;
@@ -17,6 +18,7 @@ export const USAGE_INDICATOR_CSS = `
   user-select: none;
 }
 .cn-usage-row { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.cn-usage-value[data-credit="true"] { max-width: 36px; white-space: normal; overflow-wrap: anywhere; text-align: center; font-size: 9px; }
 .cn-usage-label { color: #b9b9bd; font-size: 9px; font-weight: 500; }
 .cn-usage-reset { display: flex; flex-direction: column; align-items: center; color: #b9b9bd; font: 500 9px/11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 .cn-usage-reset[hidden], .cn-usage-reset-time[hidden] { display: none; }
@@ -35,9 +37,10 @@ export type UsageIndicatorState =
   | { kind: "unavailable"; reason: string }
   | { kind: "ready"; limits: CodexRateLimits; updatedAt: number; source?: "native-cache" };
 
-export function createUsageIndicator(doc: Document = document): {
+export function createUsageIndicator(doc: Document = document, options: { initialMode?: ProtectionMode; onModeChange?: (mode: ProtectionMode) => void } = {}): {
   root: HTMLOutputElement;
   setState: (state: UsageIndicatorState) => void;
+  setProtectionStatus: (status: ProtectionStatus, reason?: string) => void;
   dispose: () => void;
 } {
   const root = doc.createElement("output");
@@ -45,14 +48,16 @@ export function createUsageIndicator(doc: Document = document): {
   const fiveHour = doc.createElement("span");
   const weekly = doc.createElement("span");
   const resetCredits = doc.createElement("span");
-  for (const [row, label] of [[fiveHour, "5h"], [weekly, "周"], [resetCredits, "可重置"]] as const) {
+  const creditBalance = doc.createElement("span");
+  for (const [row, label] of [[fiveHour, "5h"], [weekly, "周"], [resetCredits, "重置"], [creditBalance, "点数"]] as const) {
     row.className = "cn-usage-row";
     const labelNode = doc.createElement("span");
     labelNode.className = "cn-usage-label";
     labelNode.textContent = label;
     const valueNode = doc.createElement("span");
     valueNode.className = "cn-usage-value";
-    if (row !== resetCredits) valueNode.dataset.quota = "true";
+    if (row === fiveHour || row === weekly) valueNode.dataset.quota = "true";
+    if (row === creditBalance) valueNode.dataset.credit = "true";
     row.append(labelNode, valueNode);
   }
   const timeNodes = new Map<HTMLElement, { container: HTMLElement; date: HTMLElement; clock: HTMLTimeElement }>();
@@ -68,7 +73,8 @@ export function createUsageIndicator(doc: Document = document): {
     row.append(container);
     timeNodes.set(row, { container, date, clock });
   }
-  root.append(fiveHour, weekly, resetCredits);
+  const protection = createProtectionControl(doc, options);
+  root.append(fiveHour, weekly, resetCredits, creditBalance, protection.root);
   let expiryTimer = 0;
   let resetTimer = 0;
   let lastUpdatedAt: number | null = null;
@@ -107,6 +113,7 @@ export function createUsageIndicator(doc: Document = document): {
       setValue(fiveHour, null);
       setValue(weekly, null);
       setValue(resetCredits, null);
+      setValue(creditBalance, null);
       for (const nodes of timeNodes.values()) {
         nodes.container.hidden = true;
         nodes.clock.removeAttribute("datetime");
@@ -131,14 +138,16 @@ export function createUsageIndicator(doc: Document = document): {
     const weeklyPercent = windows.weekly ? Math.round(windows.weekly.remainingPercent) : null;
     setValue(fiveHour, fiveHourPercent === null ? null : `${fiveHourPercent}%`, fiveHourPercent !== null && fiveHourPercent <= 20);
     setValue(weekly, weeklyPercent === null ? null : `${weeklyPercent}%`, weeklyPercent !== null && weeklyPercent <= 20);
+    const balance = state.limits.creditBalance ?? null;
+    setValue(creditBalance, balance);
     const resetCount = state.limits.resetCreditsAvailable;
     setValue(resetCredits, resetCount === null ? null : `${resetCount}次`);
     const fiveHourReset = setReset(fiveHour, windows.fiveHour?.resetsAt ?? null, now);
     const weeklyReset = setReset(weekly, windows.weekly?.resetsAt ?? null, now);
-    root.setAttribute("aria-label", `Codex 五小时剩余 ${fiveHourPercent === null ? "不可用" : `${fiveHourPercent}%`}，${fiveHourReset}；每周剩余 ${weeklyPercent === null ? "不可用" : `${weeklyPercent}%`}，${weeklyReset}；可用手动重置 ${resetCount === null ? "不可用" : `${resetCount}次`}`);
+    root.setAttribute("aria-label", `Codex 五小时剩余 ${fiveHourPercent === null ? "不可用" : `${fiveHourPercent}%`}，${fiveHourReset}；每周剩余 ${weeklyPercent === null ? "不可用" : `${weeklyPercent}%`}，${weeklyReset}；可用手动重置 ${resetCount === null ? "不可用" : `${resetCount}次`}；账号剩余点数 ${balance ?? "不可用"}`);
     const future = [windows.fiveHour?.resetsAt, windows.weekly?.resetsAt]
       .filter((time): time is number => typeof time === "number" && Number.isFinite(time) && time > now);
-    if (future.length) {
+    if (future.length && doc.visibilityState !== "hidden") {
       // Refresh the countdown only at its next minute boundary; no network request.
       const fiveHourDelta = (windows.fiveHour?.resetsAt ?? 0) - now;
       const nextMinute = fiveHourDelta > 0 ? (fiveHourDelta % 60_000 || 60_000) + 1 : Infinity;
@@ -154,8 +163,9 @@ export function createUsageIndicator(doc: Document = document): {
   doc.addEventListener("visibilitychange", checkFreshness);
   view?.addEventListener("focus", checkFreshness);
   setState({ kind: "loading" });
-  return { root, setState, dispose: () => {
+  return { root, setState, setProtectionStatus: protection.setStatus, dispose: () => {
     disposed = true;
+    protection.dispose();
     view?.clearTimeout(expiryTimer);
     view?.clearTimeout(resetTimer);
     doc.removeEventListener("visibilitychange", checkFreshness);

@@ -6,6 +6,8 @@ export interface QuotaWindow {
 }
 
 export interface CodexRateLimits {
+  /** Native account-wide paid credit balance; absent means unavailable. */
+  creditBalance?: string | null;
   primary: QuotaWindow | null;
   secondary: QuotaWindow | null;
   /** Optional count of currently available manual full-reset credits. */

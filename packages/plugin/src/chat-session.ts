@@ -1,9 +1,16 @@
+import { createNativeChatHistoryProvider } from "./native-chat-history.ts";
+import type { ChatHistoryCatalog } from "../../core/src/chat/history.ts";
 /** Session-only ordinary Chat navigation. It never scans a hidden Codex transcript. */
 const STORAGE_KEY = "codex-navigator-chat-reading-v1";
 const BLOCK_SELECTOR = "p,h1,h2,h3,h4,h5,h6,li,pre,blockquote,img,table";
 const ID_PATTERN = /^[a-zA-Z0-9:_-]{8,160}$/;
 
 type Anchor = { conversationId: string; turnId: string; messageId: string; blockIndex: number; viewportOffset: number; savedAt: number };
+export interface ChatHistoryProvider {
+  getCatalog(conversationId: string): (ChatHistoryCatalog & { conversationId: string }) | null;
+  reveal(conversationId: string, messageId: string, signal: AbortSignal): Promise<void>;
+}
+
 type Context = { scroll: HTMLElement; conversationId: string; turns: HTMLElement[] };
 
 function visibleChat(): Context | null {
@@ -98,6 +105,7 @@ function scrollToOffset(context: Context, target: HTMLElement, viewportOffset: n
 
 const CSS = `
 .cn-chat-rail { position:absolute; left:16px; top:50%; transform:translateY(-50%); z-index:20; width:36px; max-height:min(70vh,40rem); overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none; display:flex; flex-direction:column; color:var(--color-codex-description,#8e8e93); }
+.cn-chat-rail-coverage { font: 9px/14px -apple-system,BlinkMacSystemFont,sans-serif; color:inherit; padding-top:4px; }
 .cn-chat-rail::-webkit-scrollbar { display:none; }
 .cn-chat-rail-tick { display:flex; align-items:center; width:36px; height:10px; min-height:10px; padding:0; border:0; background:transparent; cursor:pointer; color:inherit; outline:none; }
 .cn-chat-rail-tick[data-active=true] { color:var(--color-text,currentColor); }
@@ -117,7 +125,7 @@ const CSS = `
 @media (prefers-reduced-motion:reduce) { .cn-chat-rail-line { transition:none; } }
 `;
 
-export function startChatSession(): () => void {
+export function startChatSession(history: ChatHistoryProvider = createNativeChatHistoryProvider()): () => void {
   const runtime = window as Window & { __cnChatSessionStop?: () => void };
   runtime.__cnChatSessionStop?.();
   const style = document.createElement("style");
@@ -137,6 +145,8 @@ export function startChatSession(): () => void {
   let resizeObserver: ResizeObserver | null = null;
   let disposed = false;
   let previewTimer = 0;
+  let jumpAbort: AbortController | null = null;
+  let catalog: ChatHistoryCatalog | null = null;
 
   const removeRail = () => { window.clearTimeout(previewTimer); rail?.remove(); preview?.remove(); rail = null; preview = null; lastIds = ""; };
   const save = () => {
@@ -146,7 +156,10 @@ export function startChatSession(): () => void {
   };
   const updateActive = (turnId: string) => {
     rail?.querySelectorAll<HTMLElement>("[data-cn-turn-id]").forEach((tick) => {
-      tick.dataset.active = String(tick.dataset.cnTurnId === turnId);
+      const turn = current?.turns.find(node => node.dataset.turnKey === turnId);
+      const matched = tick.dataset.cnTurnId === turnId || !!turn && [...turn.querySelectorAll<HTMLElement>("[data-chatgpt-search-message-ids]")]
+        .some(node => node.dataset.chatgptSearchMessageIds?.split(" ").includes(tick.dataset.cnTurnId ?? ""));
+      tick.dataset.active = String(matched);
       if (tick.dataset.active === "true") tick.setAttribute("aria-current", "true");
       else tick.removeAttribute("aria-current");
     });
@@ -163,7 +176,7 @@ export function startChatSession(): () => void {
     window.clearTimeout(scrollTimer);
     scrollTimer = window.setTimeout(save, 180);
   };
-  const onUserInput = () => { lastUserInput = performance.now(); if (programmatic) { generation++; programmatic = false; } };
+  const onUserInput = () => { jumpAbort?.abort(); lastUserInput = performance.now(); if (programmatic) { generation++; programmatic = false; } };
   const onResize = () => {
     if (!current || !reading || programmatic || performance.now() - lastUserInput < 250 || !lastAnchor) return;
     const node = anchorNode(current, lastAnchor);
@@ -172,37 +185,67 @@ export function startChatSession(): () => void {
   const detach = () => {
     if (current) current.scroll.removeEventListener("scroll", onScroll);
     resizeObserver?.disconnect(); resizeObserver = null;
+    jumpAbort?.abort(); catalog = null;
     current = null; removeRail();
   };
-  const jump = (turnId: string) => {
+  const findTarget = (context: Context, id: string): HTMLElement | null => {
+    const direct = context.turns.find(item => item.dataset.turnKey === id);
+    if (direct) return direct.querySelector<HTMLElement>("[data-user-message-bubble]") ?? direct;
+    const message = [...context.scroll.querySelectorAll<HTMLElement>("[data-chatgpt-search-message-ids]")]
+      .find(node => node.dataset.chatgptSearchMessageIds?.split(" ").includes(id) && node.querySelector("[data-user-message-bubble]"));
+    return message?.querySelector<HTMLElement>("[data-user-message-bubble]") ?? null;
+  };
+  const jump = async (id: string) => {
     if (!current) return;
-    const turn = current.turns.find((item) => item.dataset.turnKey === turnId);
-    if (!turn) return;
-    const target = turn.querySelector<HTMLElement>("[data-user-message-bubble]") ?? turn;
-    const token = ++generation;
+    jumpAbort?.abort(); const abort = new AbortController(); jumpAbort = abort;
+    const context = current, token = ++generation;
     programmatic = true;
-    scrollToOffset(current, target, 82);
-    requestAnimationFrame(() => {
-      if (token !== generation || !current) return;
-      scrollToOffset(current, target, 82);
-      programmatic = false;
-      reading = true;
-      save();
-    });
+    try {
+      let target = findTarget(context, id);
+      if (!target && history) {
+        const timeout = window.setTimeout(() => abort.abort(), 10000);
+        try { await history.reveal(context.conversationId, id, abort.signal); }
+        finally { window.clearTimeout(timeout); }
+        target = findTarget(context, id);
+      }
+      if (abort.signal.aborted || token !== generation || current !== context || !context.scroll.isConnected) return;
+      if (!target) { rail?.setAttribute("data-jump-error", "目标尚未加载，无法定位"); return; }
+      context.turns = [...context.scroll.querySelectorAll<HTMLElement>("[data-turn-key]")].filter(turn=>!!turn.querySelector("[data-user-message-bubble]"));
+      rail?.removeAttribute("data-jump-error");
+      scrollToOffset(context, target, 82);
+      requestAnimationFrame(() => {
+        if (abort.signal.aborted || token !== generation || current !== context || !target?.isConnected) return;
+        scrollToOffset(context, target, 82);
+        programmatic = false; reading = true; save(); updateActive(id);
+      });
+    } catch { if (token === generation) { programmatic = false; rail?.setAttribute("data-jump-error", "历史定位失败，已停止跳转"); } }
+    finally { if (token === generation && (!findTarget(context, id) || abort.signal.aborted)) programmatic = false; }
   };
   const render = () => {
     if (!current) return;
-    const signature = current.turns.map((turn) => turn.dataset.turnKey).join("|");
+    let supplied: ReturnType<ChatHistoryProvider["getCatalog"]> = null;
+    try { supplied = history?.getCatalog(current.conversationId); } catch { /* Fail closed to loaded-only coverage. */ }
+    catalog = supplied?.conversationId === current.conversationId ? supplied : null;
+    const entries = catalog?.entries ?? current.turns.map(turn => ({
+      id: turn.dataset.turnKey ?? "",
+      title: turn.querySelector<HTMLElement>("[data-user-message-bubble]")?.textContent ?? "",
+      answer: [...turn.querySelectorAll<HTMLElement>("[data-chatgpt-search-message-ids]")]
+        .find(message => !message.querySelector("[data-user-message-bubble]"))?.textContent ?? "",
+    }));
+    const complete = catalog?.complete === true;
+    const signature = `${complete}:${catalog?.branchId ?? "dom"}:` + entries.map(entry => entry.id).join("|");
     if (signature === lastIds && rail) return;
     removeRail();
     lastIds = signature;
     // Codex's own floating question rail appears only once a thread has four prompts.
-    if (current.turns.length < 4) return;
+    if (entries.length < 4) return;
     const host = current.scroll.parentElement;
     if (!host || getComputedStyle(host).position === "static") return;
     const nav = document.createElement("nav");
     nav.className = "cn-chat-rail";
-    nav.setAttribute("aria-label", `Chat 已加载的 ${current.turns.length} 次提问`);
+    nav.dataset.coverage = complete ? "complete" : "partial";
+    nav.setAttribute("aria-label", `Chat ${complete ? "完整分支" : "仅已加载"} ${entries.length} 次提问`);
+    nav.title = complete ? `当前分支完整目录：${entries.length} 次提问` : `目录尚不完整：${catalog?.reason ?? "尚未验证完整历史数据源"}`;
     const card = document.createElement("div");
     card.className = "cn-chat-rail-preview";
     card.hidden = true;
@@ -217,8 +260,8 @@ export function startChatSession(): () => void {
       nav.querySelectorAll<HTMLElement>("[data-cn-neighbor]").forEach((tick) => delete tick.dataset.cnNeighbor);
     };
     nav.addEventListener("mouseleave", clearHover);
-    for (const [index, turn] of current.turns.entries()) {
-      const id = turn.dataset.turnKey ?? "";
+    for (const [index, entry] of entries.entries()) {
+      const id = entry.id;
       const button = document.createElement("button");
       button.type = "button";
       button.className = "cn-chat-rail-tick";
@@ -232,12 +275,14 @@ export function startChatSession(): () => void {
       button.append(marker);
       button.addEventListener("click", () => jump(id));
       const showPreview = () => {
-        if (!current?.turns.includes(turn) || !turn.isConnected) return;
-        const bubble = turn.querySelector<HTMLElement>("[data-user-message-bubble]");
-        title.textContent = (bubble?.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 180) || "（无内容）";
-        const response = [...turn.querySelectorAll<HTMLElement>("[data-chatgpt-search-message-ids]")]
-          .find((message) => !message.querySelector("[data-user-message-bubble]"));
-        answer.textContent = (response?.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 350);
+        if (!current || !nav.isConnected) return;
+        const liveTurn = current.turns.find(turn => turn.dataset.turnKey === id);
+        let latestEntry = entry;
+        try { const updated = history?.getCatalog(current.conversationId); if (updated?.conversationId === current.conversationId) latestEntry = updated.entries.find(e => e.id === id) ?? entry; } catch {}
+        const liveTitle = liveTurn?.querySelector<HTMLElement>("[data-user-message-bubble]")?.textContent;
+        const liveAnswer = liveTurn ? [...liveTurn.querySelectorAll<HTMLElement>("[data-chatgpt-search-message-ids]")].find(n=>!n.querySelector("[data-user-message-bubble]"))?.textContent : null;
+        title.textContent = (liveTitle ?? latestEntry.title).trim().replace(/\s+/g, " ").slice(0, 180) || "（无内容）";
+        answer.textContent = (liveAnswer ?? latestEntry.answer).trim().replace(/\s+/g, " ").slice(0, 350);
         answer.hidden = !answer.textContent;
         const hostTop = host.getBoundingClientRect().top;
         const preferred = button.getBoundingClientRect().top - hostTop + button.getBoundingClientRect().height / 2 - 16;
@@ -262,6 +307,10 @@ export function startChatSession(): () => void {
         if (!nav.matches(":hover")) clearHover();
       });
       nav.append(button);
+    }
+    if (!complete) {
+      const status = document.createElement("span"); status.textContent = "未完整";
+      status.className = "cn-chat-rail-coverage"; status.setAttribute("role", "status"); nav.append(status);
     }
     host.append(nav, card);
     rail = nav; preview = card;

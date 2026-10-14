@@ -1,3 +1,6 @@
+import type { ProtectionEvidence } from "../../core/src/protection/controller.ts";
+import { createProtectionController } from "../../core/src/protection/controller.ts";
+import { findNativeProtectionManager, createNativeProtectionHost } from "./native-protection-host.ts";
 import { createCodexCurrentAdapter } from "../../core/src/adapters/codex-current.ts";
 import { createExplodexAppServerClient } from "../../core/src/appserver/explodex-bridge.ts";
 import { createUnavailableAppServerClient } from "../../core/src/appserver/client.ts";
@@ -146,7 +149,35 @@ function setup(api: ExplodexPluginApi): () => void {
 
   const showUsage = () => {
     if (usageTeardown) return;
-    const indicator = createUsageIndicator();
+    // Requested preference is not authorization after restart or account changes.
+    const modeKey = "explodex-codex-protection-requested";
+    let protection: ReturnType<typeof createProtectionController> | null = null;
+    let releaseLeadership: (() => void) | null = null;
+    let modeEpoch = 0;
+    let controlDisposed = false;
+    const indicator = createUsageIndicator(document, {
+      initialMode: "native", // New controller requires a new explicit activation.
+      onModeChange: mode => {
+        api.storage?.persisted?.set(modeKey, mode === "protected");
+        confirmationReset = 0;
+        window.clearTimeout(confirmationTimer);
+        const epoch = ++modeEpoch;
+        protection?.setEnabled(false);
+        releaseLeadership?.(); releaseLeadership = null;
+        if (mode === "native") return;
+        if (!protection || !navigator.locks) {
+          indicator.setProtectionStatus("unavailable", "本机管理器或跨窗口控制锁不可用。"); return;
+        }
+        indicator.setProtectionStatus("confirming", "正在取得本机唯一控制权。");
+        void navigator.locks.request("cn-codex-quota-protection-local", { ifAvailable: true }, async lock => {
+          if (controlDisposed || epoch !== modeEpoch) return;
+          if (!lock) { indicator.setProtectionStatus("unavailable", "另一窗口已控制本机保护，请先在该窗口关闭。"); return; }
+          protection!.setEnabled(true);
+          await new Promise<void>(resolve => { releaseLeadership = resolve; });
+          protection?.setEnabled(false);
+        }).catch(() => indicator.setProtectionStatus("unavailable", "本机控制锁失效。"));
+      },
+    });
     const mounted = api.mount("statusOverlay", () => indicator.root);
     if (!mounted) {
       indicator.dispose();
@@ -176,6 +207,7 @@ function setup(api: ExplodexPluginApi): () => void {
         if (rail !== observedRail || footer !== observedFooter) {
           resizeObserver.disconnect();
           mutationObserver.disconnect();
+          resizeObserver.observe(indicator.root);
           resizeObserver.observe(rail);
           resizeObserver.observe(footer);
           mutationObserver.observe(rail, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "hidden"] });
@@ -206,10 +238,63 @@ function setup(api: ExplodexPluginApi): () => void {
     window.addEventListener("resize", queuePlacement);
     const placementTimer = window.setInterval(queuePlacement, 1500);
     const sessionWindow = window as Window & { __codexNavigatorGetUsageStatus?: () => NativeUsageStatus };
-    const nativeUsage = startNativeUsageController(indicator.setState);
+    let manager: ReturnType<typeof findNativeProtectionManager> = null;
+    let latestEvidence: ProtectionEvidence | null = null;
+    let managerAttempts = 0;
+    let managerRetry = 0;
+    let stopWatching: (() => void) | null = null;
+    let evidenceExpiry = 0;
+    let confirmationTimer = 0;
+    let confirmationReset = 0;
+    let currentReset = 0;
+    const attachProtection = () => {
+      if (controlDisposed || manager) return;
+      manager = findNativeProtectionManager(document);
+      if (!manager) {
+        if (++managerAttempts < 6) managerRetry = window.setTimeout(attachProtection, 1500);
+        return;
+      }
+      const adapter = createNativeProtectionHost(manager);
+      protection = createProtectionController(adapter.host, (phase, reason) => {
+        indicator.setProtectionStatus(phase, reason);
+        if ((phase === "waiting" || phase === "confirming") && currentReset && confirmationReset !== currentReset) {
+          confirmationReset = currentReset;
+          window.clearTimeout(confirmationTimer);
+          confirmationTimer = window.setTimeout(() => {
+            if (!protection?.getStatus().enabled) return;
+            void nativeUsage.requestRefresh().catch(() => indicator.setProtectionStatus("confirming", "原生刷新不可用，等待原生自动更新；不会提前接续。"));
+          }, Math.min(2_147_483_647, Math.max(1, currentReset - Date.now() + 1000)));
+        }
+      });
+      stopWatching = adapter.watch(protection.changed, protection.cancelTask);
+      protection.update(latestEvidence);
+    };
+    const nativeUsage = startNativeUsageController(indicator.setState, document, evidence => {
+      window.clearTimeout(evidenceExpiry);
+      latestEvidence = evidence;
+      currentReset = evidence?.resetAt ?? 0;
+      const wasEnabled = protection?.getStatus().enabled;
+      protection?.update(evidence);
+      if (wasEnabled && !protection?.getStatus().enabled) { releaseLeadership?.(); releaseLeadership = null; }
+      if (evidence) evidenceExpiry = window.setTimeout(() => protection?.changed(), Math.max(1, evidence.updatedAt + 120_001 - Date.now()));
+    });
+    attachProtection();
+    const retryProtectionOnFocus = () => { if (!manager) { managerAttempts = 0; attachProtection(); } };
+    window.addEventListener("focus", retryProtectionOnFocus);
+    const protectionWindow = window as Window & { __codexNavigatorGetProtectionStatus?: () => unknown };
+    protectionWindow.__codexNavigatorGetProtectionStatus = () => ({ ...protection?.getStatus(), coverage: "local-loaded-codex", managerAvailable: !!manager });
     sessionWindow.__codexNavigatorGetUsageStatus = nativeUsage.getStatus;
     usageTeardown = () => {
       delete sessionWindow.__codexNavigatorGetUsageStatus;
+      delete protectionWindow.__codexNavigatorGetProtectionStatus;
+      window.clearTimeout(evidenceExpiry);
+      window.clearTimeout(confirmationTimer);
+      window.clearTimeout(managerRetry);
+      window.removeEventListener("focus", retryProtectionOnFocus);
+      controlDisposed = true; modeEpoch++;
+      releaseLeadership?.(); releaseLeadership = null;
+      stopWatching?.();
+      protection?.dispose();
       nativeUsage.dispose();
       window.cancelAnimationFrame(placementFrame);
       resizeObserver.disconnect();

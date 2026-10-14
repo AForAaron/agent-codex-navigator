@@ -25,8 +25,12 @@ export function formatQuotaReset(resetsAt: number | null, now = Date.now(), time
 
 /** Minute-precision countdown from the same absolute native reset timestamp. */
 export function formatQuotaCountdown(resetsAt: number | null, now = Date.now()): QuotaResetLabel {
-  const label = formatQuotaReset(resetsAt, now);
-  if (label.kind !== "scheduled" || resetsAt === null) return label;
+  if (resetsAt === null || !Number.isFinite(resetsAt) || resetsAt <= 0
+    || !Number.isFinite(new Date(resetsAt).getTime()) || resetsAt <= now) {
+    return formatQuotaReset(resetsAt, now);
+  }
   const minutes = Math.ceil((resetsAt - now) / 60_000);
-  return { ...label, date: `剩${minutes}分`, time: null, accessible: `距离自动重置还有 ${minutes} 分钟` };
+  // Local arithmetic only: no locale/date formatting is needed for a countdown.
+  return { kind: "scheduled", date: `剩${minutes}分`, time: null,
+    dateTime: new Date(resetsAt).toISOString(), accessible: `距离自动重置还有 ${minutes} 分钟` };
 }
